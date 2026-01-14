@@ -1,0 +1,22 @@
+services:
+  - type: worker
+    name: telegram-multi-session-joiner
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m bot.main
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: JOIN_DELAY_SECONDS
+        value: "60"
+      - key: EXTRACT_MESSAGES_LIMIT
+        value: "0"
+      - key: DB_PATH
+        value: "data/sessions.db"

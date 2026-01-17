@@ -5,7 +5,12 @@ import re
 from typing import Dict
 
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
+from pyrogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    Message,
+)
 
 from bot.config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 from bot import db
@@ -17,26 +22,31 @@ from bot.utils import normalize_tme_link
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
-# In-memory user states
+# ---------------- In-memory user states ----------------
 USER_STATE: Dict[int, str] = {}
 STATE_WAIT_SESSION = "wait_session"
 STATE_WAIT_CHANNELS = "wait_channels"
 
-# Join control
+# ---------------- Join control ----------------
 JOIN_RUNNING = False
 STOP_EVENT = asyncio.Event()
+JOIN_LOCK = asyncio.Lock()  # prevent concurrent start_join orchestration
 
 
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ إضافة جلسة", callback_data="add_session"),
-         InlineKeyboardButton("👁️ عرض الجلسات", callback_data="view_sessions")],
-        [InlineKeyboardButton("🗑️ حذف جلسة", callback_data="delete_session")],
-        [InlineKeyboardButton("📥 طلب قنوات الروابط", callback_data="request_channels")],
-        [InlineKeyboardButton("🚀 توزيع + انضمام", callback_data="start_join")],
-        [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")],
-        [InlineKeyboardButton("🛑 إيقاف الانضمام", callback_data="stop_join")]
-    ])
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➕ إضافة جلسة", callback_data="add_session"),
+                InlineKeyboardButton("👁️ عرض الجلسات", callback_data="view_sessions"),
+            ],
+            [InlineKeyboardButton("🗑️ حذف جلسة", callback_data="delete_session")],
+            [InlineKeyboardButton("📥 طلب قنوات الروابط", callback_data="request_channels")],
+            [InlineKeyboardButton("🚀 توزيع + انضمام", callback_data="start_join")],
+            [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")],
+            [InlineKeyboardButton("🛑 إيقاف الانضمام", callback_data="stop_join")],
+        ]
+    )
 
 
 bot = Client(
@@ -55,8 +65,9 @@ async def start_handler(client: Client, message: Message):
 
     await message.reply_text(
         "مرحباً بك.\n\n"
-        "هذا بوت إدارة جلسات Telethon لاستخراج روابط القنوات وتوزيعها (1000 لكل حساب) ثم الانضمام لها.",
-        reply_markup=main_keyboard()
+        "هذا بوت إدارة جلسات Telethon لاستخراج روابط القنوات وتوزيعها (1000 لكل حساب) ثم الانضمام لها.\n\n"
+        "ملاحظة: الإحصائيات والتقارير تُحفظ في قاعدة البيانات.",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -70,17 +81,20 @@ async def callbacks(client: Client, cq: CallbackQuery):
 
     data = cq.data
 
+    # ---------------- Add session ----------------
     if data == "add_session":
         USER_STATE[cq.from_user.id] = STATE_WAIT_SESSION
         await cq.message.edit_text(
             "➕ **إضافة جلسة Telethon**\n\n"
             "أرسل الآن StringSession (نص طويل)\n"
             "ملاحظة: سيتم قبول الرسالة إذا طولها أكبر من 100 حرف.",
-            reply_markup=main_keyboard()
+            reply_markup=main_keyboard(),
         )
         await cq.answer()
+        return
 
-    elif data == "view_sessions":
+    # ---------------- View sessions ----------------
+    if data == "view_sessions":
         sessions = db.list_sessions()
         if not sessions:
             await cq.message.edit_text("لا توجد جلسات.", reply_markup=main_keyboard())
@@ -91,8 +105,10 @@ async def callbacks(client: Client, cq: CallbackQuery):
                 txt += f"- ID: `{sid}` | 📱 {phone or '-'} | 📅 {created}\n"
             await cq.message.edit_text(txt, reply_markup=main_keyboard())
         await cq.answer()
+        return
 
-    elif data == "delete_session":
+    # ---------------- Delete session ----------------
+    if data == "delete_session":
         sessions = db.list_sessions()
         if not sessions:
             await cq.message.edit_text("لا توجد جلسات لحذفها.", reply_markup=main_keyboard())
@@ -104,73 +120,113 @@ async def callbacks(client: Client, cq: CallbackQuery):
             kb.append([InlineKeyboardButton("رجوع", callback_data="back")])
             await cq.message.edit_text("اختر الجلسة المراد حذفها:", reply_markup=InlineKeyboardMarkup(kb))
         await cq.answer()
+        return
 
-    elif data.startswith("del_"):
+    if data.startswith("del_"):
         sid = int(data.split("_")[-1])
+        # NOTE: this is hard delete in current db.py
+        # We will later upgrade to soft-delete to avoid losing assignments.
         db.delete_session(sid)
         await cq.message.edit_text(f"✅ تم حذف الجلسة {sid}", reply_markup=main_keyboard())
         await cq.answer()
+        return
 
-    elif data == "request_channels":
+    # ---------------- Request channels ----------------
+    if data == "request_channels":
         USER_STATE[cq.from_user.id] = STATE_WAIT_CHANNELS
         await cq.message.edit_text(
             "📥 **إرسال قنوات الروابط**\n\n"
             "أرسل الآن روابط قنواتك الخاصة (يمكن أكثر من رابط برسالة واحدة).\n"
-            "البوت سيقوم باستخراج روابط تيليجرام من أول رسالة إلى آخر رسالة.\n\n"
+            "البوت سيقوم باستخراج روابط تيليجرام من الرسائل.\n\n"
             "مثال:\n"
             "https://t.me/channel1\n"
             "https://t.me/channel2",
-            reply_markup=main_keyboard()
+            reply_markup=main_keyboard(),
         )
         await cq.answer()
+        return
 
-    elif data == "start_join":
+    # ---------------- Start join orchestration ----------------
+    if data == "start_join":
         if JOIN_RUNNING:
             await cq.answer("عملية الانضمام تعمل بالفعل!", show_alert=True)
             return
 
-        JOIN_RUNNING = True
-        STOP_EVENT.clear()
+        # prevent multi-click race
+        async with JOIN_LOCK:
+            if JOIN_RUNNING:
+                await cq.answer("عملية الانضمام تعمل بالفعل!", show_alert=True)
+                return
 
-        await cq.message.edit_text(
-            "🚀 بدء العملية:\n"
-            "1) توزيع الروابط 1000 لكل Session (بدون تكرار)\n"
-            "2) تشغيل الانضمام لكل الحسابات بالتوازي\n\n"
-            "سيتم إرسال تقارير هنا.",
-            reply_markup=main_keyboard()
-        )
-        await cq.answer()
+            JOIN_RUNNING = True
+            STOP_EVENT.clear()
 
-        asyncio.create_task(orchestrate_join(cq.message))
+            await cq.message.edit_text(
+                "🚀 بدء العملية:\n"
+                "1) توزيع الروابط 1000 لكل Session (بدون تكرار)\n"
+                "2) تشغيل الانضمام لكل الحسابات بالتوازي\n\n"
+                "سيتم إرسال تقارير هنا.",
+                reply_markup=main_keyboard(),
+            )
+            await cq.answer()
 
-    elif data == "stats":
+            asyncio.create_task(orchestrate_join(cq.message))
+        return
+
+    # ---------------- Stats ----------------
+    if data == "stats":
         st = db.get_stats()
         needed = estimate_needed_sessions()
+
+        # Use .get() to prevent crashing if db.get_stats not yet updated
+        sessions = st.get("sessions", 0)
+        total_links = st.get("total_links", 0)
+        assigned = st.get("assigned", 0)
+        unassigned = st.get("unassigned", 0)
+        pending = st.get("pending", 0)
+        success = st.get("success", 0)
+        failed = st.get("failed", 0)
+
+        dead_links = st.get("dead_links", 0)
+        reserve_links = st.get("reserve_links", 0)
+
+        processed = success + failed
+        success_rate = (success / processed * 100.0) if processed else 0.0
+
         txt = (
             "📊 **الإحصائيات**\n\n"
-            f"👥 Sessions: {st['sessions']}\n\n"
-            f"🔗 Links Total: {st['total_links']}\n"
-            f"📌 Assigned: {st['assigned']}\n"
-            f"🆓 Unassigned: {st['unassigned']}\n\n"
-            f"⏳ Pending joins: {st['pending']}\n"
-            f"✅ Success: {st['success']}\n"
-            f"❌ Failed: {st['failed']}\n\n"
-            f"🧮 تحتاج تقريباً إلى Sessions إضافية لمعالجة غير الموزع: {needed['needed_sessions']}"
+            f"👥 Sessions: {sessions}\n\n"
+            f"🔗 Links Total: {total_links}\n"
+            f"☠️ Dead Links: {dead_links}\n"
+            f"📦 Reserve (Unassigned Active): {reserve_links}\n\n"
+            f"📌 Assigned: {assigned}\n"
+            f"🆓 Unassigned: {unassigned}\n\n"
+            f"⏳ Pending joins: {pending}\n"
+            f"✅ Success: {success}\n"
+            f"❌ Failed: {failed}\n"
+            f"📈 Success rate: {success_rate:.2f}%\n\n"
+            f"🧮 تحتاج تقريباً إلى Sessions إضافية لمعالجة غير الموزع: {needed.get('needed_sessions')}\n"
         )
+
         await cq.message.edit_text(txt, reply_markup=main_keyboard())
         await cq.answer()
+        return
 
-    elif data == "stop_join":
+    # ---------------- Stop join ----------------
+    if data == "stop_join":
         if not JOIN_RUNNING:
             await cq.answer("لا توجد عملية انضمام شغالة.", show_alert=True)
             return
         STOP_EVENT.set()
         await cq.message.edit_text("🛑 تم طلب الإيقاف... سيتم الإيقاف بأقرب فرصة.", reply_markup=main_keyboard())
         await cq.answer()
+        return
 
-    elif data == "back":
+    # ---------------- Back ----------------
+    if data == "back":
         await cq.message.edit_text("اختر:", reply_markup=main_keyboard())
         await cq.answer()
+        return
 
 
 @bot.on_message(filters.private & ~filters.command("start"))
@@ -180,6 +236,7 @@ async def private_text_handler(client: Client, message: Message):
 
     state = USER_STATE.get(message.from_user.id)
 
+    # ---------------- Add session state ----------------
     if state == STATE_WAIT_SESSION:
         text = (message.text or "").strip()
         if len(text) < 100:
@@ -195,8 +252,10 @@ async def private_text_handler(client: Client, message: Message):
         USER_STATE.pop(message.from_user.id, None)
         return
 
+    # ---------------- Wait channels state ----------------
     if state == STATE_WAIT_CHANNELS:
         text = message.text or ""
+
         channel_links = re.findall(r"(https?://t\.me/\S+)", text)
         channel_links = [normalize_tme_link(x) for x in channel_links]
 
@@ -224,11 +283,19 @@ async def private_text_handler(client: Client, message: Message):
                 await message.reply_text(f"❌ فشل استخراج {ch}\nالسبب: {e}")
 
         USER_STATE.pop(message.from_user.id, None)
-        await message.reply_text(f"🏁 انتهى الاستخراج. إجمالي الروابط الجديدة: {total_added}", reply_markup=main_keyboard())
+        await message.reply_text(
+            f"🏁 انتهى الاستخراج. إجمالي الروابط الجديدة: {total_added}",
+            reply_markup=main_keyboard(),
+        )
         return
 
 
 async def orchestrate_join(message: Message):
+    """
+    Orchestrates:
+    1) distribute links to sessions (1000 each)
+    2) run concurrent joiners (Telethon) for each session
+    """
     global JOIN_RUNNING
 
     try:
@@ -239,7 +306,7 @@ async def orchestrate_join(message: Message):
 
         # 1) distribute
         report = distribute_links_to_sessions()
-        if not report["ok"]:
+        if not report.get("ok"):
             await message.reply_text(f"❌ فشل التوزيع: {report.get('error')}")
             return
 
@@ -260,7 +327,14 @@ async def orchestrate_join(message: Message):
 
         tasks = []
         for sid, session_string, _, _ in sessions:
-            tasks.append(run_session_joiner(sid, session_string, limit=1000, stop_flag=STOP_EVENT))
+            tasks.append(
+                run_session_joiner(
+                    sid,
+                    session_string,
+                    limit=1000,
+                    stop_flag=STOP_EVENT,
+                )
+            )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 

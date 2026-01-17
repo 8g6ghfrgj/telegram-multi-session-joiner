@@ -11,53 +11,72 @@ logger = logging.getLogger(__name__)
 
 async def extract_links_from_channel(session_string: str, channel_link: str) -> list[str]:
     """
-    Extract telegram links from ALL messages in the channel:
+    Extract telegram links from channel messages.
 
-    - if EXTRACT_MESSAGES_LIMIT=0: from first message to last message
-    - else: last N messages only
+    Modes:
+    - if EXTRACT_MESSAGES_LIMIT == 0:
+        Extract from first message to last message (reverse=True)
+    - if EXTRACT_MESSAGES_LIMIT > 0:
+        Extract last N messages only
 
-    IMPORTANT:
-    - We normalize all extracted links to unified format:
+    Output:
+    - returns unique links normalized to:
       https://t.me/<path>
-    - Also normalize channel_link itself.
+
+    Notes:
+    - Uses Telethon StringSession.
+    - Will ignore empty messages.
     """
     channel_link = normalize_tme_link(channel_link)
 
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     await client.connect()
 
+    found = set()
+
     try:
         entity = await client.get_entity(channel_link)
 
-        found = set()
-
-        # Fast mode: last N messages only
+        # ---------------- Fast mode: last N messages ----------------
         if EXTRACT_MESSAGES_LIMIT and EXTRACT_MESSAGES_LIMIT > 0:
+            logger.info(
+                f"[extractor] Extracting last {EXTRACT_MESSAGES_LIMIT} messages from {channel_link}"
+            )
+
             async for msg in client.iter_messages(entity, limit=EXTRACT_MESSAGES_LIMIT):
                 if not msg:
                     continue
 
                 text = msg.message or ""
-                if not text:
+                if not text.strip():
                     continue
 
                 for link in extract_telegram_links(text):
-                    found.add(normalize_tme_link(link))
+                    n = normalize_tme_link(link)
+                    if n:
+                        found.add(n)
 
-        # Full mode: extract from first message to last message
+        # ---------------- Full mode: all messages ----------------
         else:
+            logger.info(f"[extractor] Extracting ALL messages from {channel_link}")
+
+            # reverse=True: from first message to last message
             async for msg in client.iter_messages(entity, reverse=True):
                 if not msg:
                     continue
 
                 text = msg.message or ""
-                if not text:
+                if not text.strip():
                     continue
 
                 for link in extract_telegram_links(text):
-                    found.add(normalize_tme_link(link))
+                    n = normalize_tme_link(link)
+                    if n:
+                        found.add(n)
 
-        return sorted(found)
+        result = sorted(found)
+        logger.info(f"[extractor] Done. Found {len(result)} unique links from {channel_link}")
+        return result
 
     finally:
         await client.disconnect()

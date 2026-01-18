@@ -1,6 +1,7 @@
 # bot/main.py
 import asyncio
 import logging
+import os
 import re
 from typing import Dict
 
@@ -32,11 +33,18 @@ def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ إضافة جلسة", callback_data="add_session"),
          InlineKeyboardButton("👁️ عرض الجلسات", callback_data="view_sessions")],
+
         [InlineKeyboardButton("🗑️ حذف جلسة", callback_data="delete_session")],
+
         [InlineKeyboardButton("📥 طلب قنوات الروابط", callback_data="request_channels")],
+
         [InlineKeyboardButton("🚀 توزيع + انضمام", callback_data="start_join")],
+
+        [InlineKeyboardButton("📤 تصدير الروابط", callback_data="export_links")],
+
         [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")],
-        [InlineKeyboardButton("🛑 إيقاف الانضمام", callback_data="stop_join")]
+
+        [InlineKeyboardButton("🛑 إيقاف الانضمام", callback_data="stop_join")],
     ])
 
 
@@ -99,6 +107,15 @@ def _fmt_stats_text(st: dict) -> str:
     return txt
 
 
+def _safe_write_txt_file(filepath: str, lines: list[str]) -> None:
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        if not lines:
+            f.write("")
+        else:
+            f.write("\n".join(lines))
+
+
 @bot.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     if message.from_user.id != OWNER_ID:
@@ -112,7 +129,8 @@ async def start_handler(client: Client, message: Message):
         "- Reserve روابط للاستبدال الفوري\n"
         "- وسم الروابط الميتة Dead وعدم تكرارها\n"
         "- FloodWait Sleep وإكمال تلقائي\n"
-        "- Join Request حالة requested بدل فشل\n",
+        "- Join Request حالة requested بدل فشل\n"
+        "- تصدير الروابط لكل Session + الاحتياطي\n",
         reply_markup=main_keyboard()
     )
 
@@ -192,6 +210,49 @@ async def callbacks(client: Client, cq: CallbackQuery):
             reply_markup=main_keyboard()
         )
         await cq.answer()
+        return
+
+    # ---------------- export_links ----------------
+    if data == "export_links":
+        sessions = db.list_sessions()
+        if not sessions:
+            await cq.answer("لا توجد Sessions.", show_alert=True)
+            return
+
+        await cq.message.edit_text(
+            "📤 **تصدير الروابط**\n\n"
+            "جاري تجهيز الملفات...\n"
+            "- سيتم إرسال ملف لكل Session (حتى 1000 رابط)\n"
+            "- وسيتم إرسال ملف Reserve (500 رابط احتياطي)\n",
+            reply_markup=main_keyboard()
+        )
+        await cq.answer()
+
+        # Export per session
+        for sid, _, phone, _ in sessions:
+            links = db.get_links_for_session_export(sid, limit=1000)
+
+            filename = f"/tmp/session_{sid}_links.txt"
+            _safe_write_txt_file(filename, links)
+
+            caption = (
+                f"📌 Session {sid}\n"
+                f"📱 Phone: {phone or '-'}\n"
+                f"🔗 Links: {len(links)}"
+            )
+            await cq.message.reply_document(filename, caption=caption)
+
+        # Export reserve
+        reserve_links = db.get_reserve_links_export(limit=500)
+        reserve_file = "/tmp/reserve_links_500.txt"
+        _safe_write_txt_file(reserve_file, reserve_links)
+
+        await cq.message.reply_document(
+            reserve_file,
+            caption=f"📦 Reserve Links (احتياطي)\n🔗 Links: {len(reserve_links)}"
+        )
+
+        await cq.message.reply_text("✅ تم التصدير بنجاح.", reply_markup=main_keyboard())
         return
 
     # ---------------- start_join ----------------
@@ -363,7 +424,6 @@ async def orchestrate_join(message: Message):
             if isinstance(res, Exception):
                 final_txt += f"❌ خطأ: {res}\n"
             else:
-                # requested is supported now
                 final_txt += (
                     f"- Session {res.get('session_id')}: "
                     f"✅ {res.get('success', 0)} | "
